@@ -693,7 +693,11 @@ def _rclone_deletefile(drive_path: str) -> bool:
     except FileNotFoundError:
         raise
     if result.returncode != 0:
-        log.error("rclone deletefile failed for %s: %s", drive_path, result.stderr.strip())
+        stderr = result.stderr.strip()
+        if "object not found" in stderr:
+            log.warning("[SKIP]    %s already absent from Drive -- removing DB record", drive_path)
+            return True
+        log.error("rclone deletefile failed for %s: %s", drive_path, stderr)
         return False
     return True
 
