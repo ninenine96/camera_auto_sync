@@ -22,6 +22,7 @@ del _os, _sys, _here, _sp
 import json
 import os
 import sys
+import tempfile
 import time
 import sqlite3
 import subprocess
@@ -686,20 +687,43 @@ def upload_new_files_batch(
 # ---------------------------------------------------------------------------
 # Sync pipeline -- step 3: delete
 # ---------------------------------------------------------------------------
-def _rclone_deletefile(drive_path: str) -> bool:
-    cmd = _rclone_cmd("deletefile", drive_path, "--drive-use-trash=false")
+def _rclone_delete_batch(remote_dir: str, filenames: list[str]) -> tuple[bool, bool]:
+    """
+    Delete a batch of files from a single remote directory using --files-from.
+    Returns (success, already_gone) where already_gone means "object not found".
+    """
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write("\n".join(filenames) + "\n")
+            tmp_path = tmp.name
+    except OSError as exc:
+        log.error("[DELETE]  Could not write temp file-list: %s", exc)
+        return False, False
+
+    try:
+        cmd = _rclone_cmd(
+            "delete", remote_dir,
+            "--files-from", tmp_path,
+            "--drive-use-trash=false",
+        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     except FileNotFoundError:
         raise
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
     if result.returncode != 0:
         stderr = result.stderr.strip()
         if "object not found" in stderr:
-            log.warning("[SKIP]    %s already absent from Drive -- removing DB record", drive_path)
-            return True
-        log.error("rclone deletefile failed for %s: %s", drive_path, stderr)
-        return False
-    return True
+            return True, True
+        log.error("rclone delete failed for %s: %s", remote_dir, stderr)
+        return False, False
+    return True, False
 
 
 def delete_removed_files(
@@ -708,27 +732,38 @@ def delete_removed_files(
 ) -> int:
     """
     Delete from Drive files that are in the uploads index but absent from the
-    current camera scan. Records are kept on rclone failure so deletion is
-    retried next session.
+    current camera scan. Groups by remote directory and issues one rclone call
+    per directory. Records are kept on rclone failure so deletion is retried
+    next session.
     """
     current_paths = set(camera_files.keys())
     in_db = [row[0] for row in db_conn.execute("SELECT drive_path FROM uploads")]
     to_delete = [dp for dp in in_db if dp not in current_paths]
     log.info("%d file(s) to delete from Drive", len(to_delete))
+    if not to_delete:
+        return 0
+
+    # Group by remote directory
+    by_dir: dict[str, list[str]] = {}
+    for drive_path in to_delete:
+        remote_dir, fname = drive_path.rsplit("/", 1)
+        by_dir.setdefault(remote_dir, []).append(fname)
 
     deleted = 0
-    for drive_path in to_delete:
-        if drive_path in current_paths:
-            log.warning("[SKIP]    Deletion skipped -- file reappeared in scan: %s", drive_path)
-            continue
-        fname = drive_path.rsplit("/", 1)[-1]
-        log.info("[DELETE]  %s (removed from camera)", fname)
-        if _rclone_deletefile(drive_path):
-            db_conn.execute("DELETE FROM uploads WHERE drive_path = ?", (drive_path,))
-            deleted += 1
-            log.info("[OK]      Deleted from Drive: %s", drive_path)
+    for remote_dir, fnames in by_dir.items():
+        log.info("[DELETE]  %d file(s) from %s", len(fnames), remote_dir)
+        ok, already_gone = _rclone_delete_batch(remote_dir, fnames)
+        if ok:
+            drive_paths = [f"{remote_dir}/{fname}" for fname in fnames]
+            placeholders = ",".join("?" * len(drive_paths))
+            db_conn.execute(f"DELETE FROM uploads WHERE drive_path IN ({placeholders})", drive_paths)
+            deleted += len(fnames)
+            if already_gone:
+                log.warning("[SKIP]    Files already absent from Drive -- DB records removed")
+            else:
+                log.info("[OK]      Deleted %d file(s) from Drive", len(fnames))
         else:
-            log.error("[FAILED]  Could not delete %s -- will retry next session", drive_path)
+            log.error("[FAILED]  Could not delete from %s -- will retry next session", remote_dir)
     return deleted
 
 
