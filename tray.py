@@ -157,6 +157,7 @@ def _show_toast(title: str, msg: str) -> None:
         r = subprocess.run(
             ["powershell", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script],
             capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if r.returncode == 0:
             _log_tray(f"Toast OK: {title}")
