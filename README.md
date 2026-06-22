@@ -22,6 +22,7 @@ A Windows Service that automatically syncs photos from a Sony ZV-E10 to Google D
 |---|---|
 | 🔌 **USB Auto-detect** | WMI event listener fires the moment your camera mounts |
 | ☁️ **Google Drive sync** | Uploads via rclone into a tidy `YYYY/MM/RAW` & `YYYY/MM/JPG` tree |
+| 🖼️ **Google Photos (optional)** | Route JPEGs to Google Photos month albums while RAW stays on Drive |
 | ⚡ **Two upload modes** | `individual` (parallel workers) or `batch` (rclone `--files-from`) |
 | 🔄 **Smart retry** | Files that fail retry up to 3× — persistent failures are queued for the next connection |
 | 🗑️ **Mirror deletes** | Removes Drive copies of files deleted from the camera — only after a clean upload |
@@ -115,6 +116,8 @@ copy .env.example .env
 | `DRIVE_BASE_PATH` | ✅ | — | Base folder on Drive (e.g. `Photos/Camera`) |
 | `RCLONE_PATH` | ✅ | — | Full path to `rclone.exe` |
 | `RCLONE_CONF` | ✅ | — | Full path to `rclone.conf` |
+| `GPHOTOS_REMOTE` | ➖ | *(off)* | rclone Google Photos remote name. When set, JPEGs go to Photos month albums instead of Drive |
+| `GPHOTOS_ALBUM_PREFIX` | ➖ | `Camera` | Album name prefix — a JPEG from May 2026 lands in album `Camera 2026-05` |
 | `DCIM_PATH_OVERRIDE` | ➖ | *(auto-detect)* | Hard-code DCIM path if camera always mounts to the same letter |
 | `DB_PATH` | ➖ | `C:\ProgramData\CameraSync\sync.db` | SQLite database path |
 | `LOG_PATH` | ➖ | `C:\ProgramData\CameraSync\sync.log` | Rotating log file path |
@@ -264,6 +267,44 @@ Photos/Camera/
 ```
 
 Any extension that isn't `.JPG` / `.JPEG` lands in the `RAW/` folder.
+
+---
+
+## 🖼️ Sending JPEGs to Google Photos
+
+By default both RAW and JPEG go to Drive. To route JPEGs to **Google Photos**
+instead (RAW still goes to Drive), add a Google Photos remote and point the
+service at it.
+
+### 1. Create the remote
+
+```powershell
+rclone config   # add a new remote, storage type "Google Photos", e.g. named 'gphotos'
+rclone lsd gphotos:album
+```
+
+### 2. Enable it in `.env`
+
+```dotenv
+GPHOTOS_REMOTE=gphotos
+GPHOTOS_ALBUM_PREFIX=Camera
+```
+
+JPEGs are now uploaded into a month album per capture date:
+
+```
+Google Photos
+└── Albums
+    ├── Camera 2026-05   ← DSC00001.JPG, DSC00002.JPG, …
+    └── Camera 2026-06   ← …
+```
+
+RAW files continue to land on Drive under `Photos/Camera/YYYY/MM/RAW/`.
+
+> **Heads-up — deletes don't mirror to Photos.** The Google Photos API cannot
+> delete media, so a JPEG removed from the camera stays in Photos. Its index
+> record is kept on purpose so the file is never re-uploaded (which would create
+> a duplicate). Mirror-delete still works normally for RAW files on Drive.
 
 ---
 

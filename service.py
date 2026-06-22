@@ -48,6 +48,12 @@ load_dotenv()
 
 RCLONE_REMOTE      = os.getenv("RCLONE_REMOTE", "gdrive")
 DRIVE_BASE_PATH    = os.getenv("DRIVE_BASE_PATH", "Photos/Camera")
+
+# When GPHOTOS_REMOTE is set to an rclone Google Photos remote name, JPEG/JPEG
+# files are uploaded there (into month albums) instead of to Drive. RAW files
+# always go to Drive. Leave empty to send everything to Drive as before.
+GPHOTOS_REMOTE       = os.getenv("GPHOTOS_REMOTE", "")
+GPHOTOS_ALBUM_PREFIX = os.getenv("GPHOTOS_ALBUM_PREFIX", "Camera")
 DCIM_PATH_OVERRIDE = os.getenv("DCIM_PATH_OVERRIDE", "")
 DB_PATH            = os.getenv("DB_PATH",      r"C:\ProgramData\CameraSync\sync.db")
 LOG_PATH           = os.getenv("LOG_PATH",     r"C:\ProgramData\CameraSync\sync.log")
@@ -204,9 +210,35 @@ def _parse_year_month(date_str: str) -> tuple[str, str]:
         return str(now.year), f"{now.month:02d}"
 
 
+def _is_jpeg(filename: str) -> bool:
+    return os.path.splitext(filename)[1].upper() in (".JPG", ".JPEG")
+
+
 def _file_type_folder(filename: str) -> str:
     """Return 'JPG' for .jpg/.jpeg files, 'RAW' for every other extension."""
-    return "JPG" if os.path.splitext(filename)[1].upper() in (".JPG", ".JPEG") else "RAW"
+    return "JPG" if _is_jpeg(filename) else "RAW"
+
+
+def _is_gphotos_path(drive_path: str) -> bool:
+    """True if drive_path targets the configured Google Photos remote."""
+    return bool(GPHOTOS_REMOTE) and drive_path.startswith(f"{GPHOTOS_REMOTE}:")
+
+
+def _dest_for(filename: str, yyyy: str, mm: str) -> str:
+    """
+    Return the full rclone destination path for a file.
+
+    JPEGs go to a Google Photos month album when GPHOTOS_REMOTE is configured:
+        gphotos:album/Camera 2026-05/DSC00001.JPG
+    Everything else (and all files when Google Photos is disabled) goes to Drive:
+        gdrive:Photos/Camera/2026/05/RAW/DSC00001.ARW
+        gdrive:Photos/Camera/2026/05/JPG/DSC00001.JPG
+    """
+    if GPHOTOS_REMOTE and _is_jpeg(filename):
+        album = f"{GPHOTOS_ALBUM_PREFIX} {yyyy}-{mm}"
+        return f"{GPHOTOS_REMOTE}:album/{album}/{filename}"
+    type_folder = _file_type_folder(filename)
+    return f"{RCLONE_REMOTE}:{DRIVE_BASE_PATH}/{yyyy}/{mm}/{type_folder}/{filename}"
 
 
 # ---------------------------------------------------------------------------
@@ -252,9 +284,10 @@ def scan_camera_files(dcim_root: str) -> dict[str, CameraFile]:
     Recursively find all .ARW, .JPG, and .JPEG files under dcim_root.
     Returns a dict keyed by drive_path.
 
-    Drive path format:
+    Destination path format (see _dest_for):
         gdrive:Photos/Camera/YYYY/MM/RAW/IMG_1234.ARW
-        gdrive:Photos/Camera/YYYY/MM/JPG/IMG_1234.JPG
+        gdrive:Photos/Camera/YYYY/MM/JPG/IMG_1234.JPG   (Google Photos disabled)
+        gphotos:album/Camera YYYY-MM/IMG_1234.JPG        (Google Photos enabled)
     """
     results: dict[str, CameraFile] = {}
     for root, _, files in os.walk(dcim_root):
@@ -269,9 +302,7 @@ def scan_camera_files(dcim_root: str) -> dict[str, CameraFile]:
                 continue
             date_str    = _get_date_taken(full)
             yyyy, mm    = _parse_year_month(date_str)
-            type_folder = _file_type_folder(fname)
-            dest_dir    = f"{DRIVE_BASE_PATH}/{yyyy}/{mm}/{type_folder}"
-            drive_path  = f"{RCLONE_REMOTE}:{dest_dir}/{fname}"
+            drive_path  = _dest_for(fname, yyyy, mm)
             results[drive_path] = CameraFile(
                 filename=fname,
                 full_path=full,
@@ -633,37 +664,47 @@ def upload_new_files_batch(
         conn.execute("PRAGMA journal_mode=WAL")
         conn.isolation_level = None
         try:
-            batch_ok = False
-            for attempt in range(1, UPLOAD_MAX_RETRIES + 1):
-                if _rclone_copy_batch(stable, dest_dir):
-                    for cf in stable:
-                        _insert_upload(conn, cf, camera_serial)
-                        conn.execute(
-                            "DELETE FROM failed_uploads WHERE drive_path = ?",
-                            (cf.drive_path,),
-                        )
-                        log.info(
-                            "[OK]      %s (%s) uploaded", cf.filename, _fmt_size(cf.size_bytes)
-                        )
+            # Google Photos backend hangs on rclone copy <dir> --files-from;
+            # upload each file individually instead.
+            if _is_gphotos_path(dest_dir):
+                for cf in stable:
+                    if _upload_one(cf, conn, camera_serial):
                         uploaded       += 1
                         bytes_uploaded += cf.size_bytes
-                    batch_ok = True
-                    break
-                if attempt < UPLOAD_MAX_RETRIES:
-                    log.warning(
-                        "[RETRY]   Batch attempt %d/%d failed for %d file(s) -> %s -- waiting %ds",
-                        attempt, UPLOAD_MAX_RETRIES, len(stable), dest_dir, UPLOAD_RETRY_DELAY,
-                    )
-                    time.sleep(UPLOAD_RETRY_DELAY)
-
-            if not batch_ok:
-                log.warning(
-                    "[FALLBACK] Batch failed after %d attempts -> retrying %d file(s) individually",
-                    UPLOAD_MAX_RETRIES, len(stable),
-                )
-                for cf in stable:
-                    if not _upload_one(cf, conn, camera_serial):
+                    else:
                         all_ok = False
+            else:
+                batch_ok = False
+                for attempt in range(1, UPLOAD_MAX_RETRIES + 1):
+                    if _rclone_copy_batch(stable, dest_dir):
+                        for cf in stable:
+                            _insert_upload(conn, cf, camera_serial)
+                            conn.execute(
+                                "DELETE FROM failed_uploads WHERE drive_path = ?",
+                                (cf.drive_path,),
+                            )
+                            log.info(
+                                "[OK]      %s (%s) uploaded", cf.filename, _fmt_size(cf.size_bytes)
+                            )
+                            uploaded       += 1
+                            bytes_uploaded += cf.size_bytes
+                        batch_ok = True
+                        break
+                    if attempt < UPLOAD_MAX_RETRIES:
+                        log.warning(
+                            "[RETRY]   Batch attempt %d/%d failed for %d file(s) -> %s -- waiting %ds",
+                            attempt, UPLOAD_MAX_RETRIES, len(stable), dest_dir, UPLOAD_RETRY_DELAY,
+                        )
+                        time.sleep(UPLOAD_RETRY_DELAY)
+
+                if not batch_ok:
+                    log.warning(
+                        "[FALLBACK] Batch failed after %d attempts -> retrying %d file(s) individually",
+                        UPLOAD_MAX_RETRIES, len(stable),
+                    )
+                    for cf in stable:
+                        if not _upload_one(cf, conn, camera_serial):
+                            all_ok = False
         finally:
             conn.close()
 
@@ -738,7 +779,22 @@ def delete_removed_files(
     """
     current_paths = set(camera_files.keys())
     in_db = [row[0] for row in db_conn.execute("SELECT drive_path FROM uploads")]
-    to_delete = [dp for dp in in_db if dp not in current_paths]
+    # Google Photos cannot be deleted via the API/rclone. JPEGs that went to a
+    # Photos album stay there; their index records are kept so they are never
+    # re-uploaded (which would create duplicates in Photos).
+    to_delete = [
+        dp for dp in in_db
+        if dp not in current_paths and not _is_gphotos_path(dp)
+    ]
+    skipped_gphotos = sum(
+        1 for dp in in_db
+        if dp not in current_paths and _is_gphotos_path(dp)
+    )
+    if skipped_gphotos:
+        log.info(
+            "%d Google Photos file(s) removed from camera -- left in Photos "
+            "(API has no delete; records kept)", skipped_gphotos,
+        )
     log.info("%d file(s) to delete from Drive", len(to_delete))
     if not to_delete:
         return 0
