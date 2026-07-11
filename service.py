@@ -59,8 +59,10 @@ DB_PATH            = os.getenv("DB_PATH",      r"C:\ProgramData\CameraSync\sync.
 LOG_PATH           = os.getenv("LOG_PATH",     r"C:\ProgramData\CameraSync\sync.log")
 STATE_PATH         = os.getenv("STATE_PATH",   r"C:\ProgramData\CameraSync\state.json")
 NOTIFY_PATH        = os.getenv("NOTIFY_PATH",  r"C:\ProgramData\CameraSync\notify.json")
+PROGRESS_PATH      = os.getenv("PROGRESS_PATH", r"C:\ProgramData\CameraSync\progress.json")
 RCLONE_EXE         = os.getenv("RCLONE_PATH",  "rclone")
 RCLONE_CONF        = os.getenv("RCLONE_CONF",  "")
+LOG_LEVEL          = os.getenv("LOG_LEVEL",    "INFO")  # set DEBUG for per-file [OK] lines
 
 UPLOAD_MAX_RETRIES    = 3
 UPLOAD_RETRY_DELAY    = 5     # seconds between per-file retry attempts
@@ -73,12 +75,24 @@ PIPELINE_BACKOFF_MAX  = 1800  # seconds -- cap at 30 minutes
 log = logging.getLogger("CameraSync")
 
 
-def _fmt_size(n: int) -> str:
+def _fmt_size(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
             return f"{n:.1f} {unit}"
-        n //= 1024
+        n /= 1024
     return f"{n:.1f} TB"
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format a duration as '14m 32s' / '1h 03m 05s' / '42s'."""
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
 
 
 def _progress_bar(done: int, total: int, width: int = 30) -> str:
@@ -110,6 +124,50 @@ class CameraFile:
     drive_path: str   # full rclone path, e.g. "gdrive:Photos/Camera/2026/05/RAW/IMG_1234.ARW"
 
 
+@dataclass
+class UploadStats:
+    """
+    Result of one upload phase, broken down by destination so the end-of-sync
+    summary can report Google Photos and Google Drive separately.
+    """
+    all_ok:         bool = True   # False if any file exhausted its retries
+    paused:         bool = False  # True if the user paused mid-upload
+    already_synced: int  = 0      # files on camera already in the uploads index
+    gphotos_count:  int  = 0
+    gphotos_bytes:  int  = 0
+    gdrive_count:   int  = 0
+    gdrive_bytes:   int  = 0
+    gphotos_failed: int  = 0
+    gdrive_failed:  int  = 0
+
+    @property
+    def uploaded(self) -> int:
+        return self.gphotos_count + self.gdrive_count
+
+    @property
+    def bytes_uploaded(self) -> int:
+        return self.gphotos_bytes + self.gdrive_bytes
+
+    @property
+    def failed(self) -> int:
+        return self.gphotos_failed + self.gdrive_failed
+
+    def record_success(self, cf: CameraFile) -> None:
+        if _is_gphotos_path(cf.drive_path):
+            self.gphotos_count += 1
+            self.gphotos_bytes += cf.size_bytes
+        else:
+            self.gdrive_count += 1
+            self.gdrive_bytes += cf.size_bytes
+
+    def record_failure(self, cf: CameraFile) -> None:
+        self.all_ok = False
+        if _is_gphotos_path(cf.drive_path):
+            self.gphotos_failed += 1
+        else:
+            self.gdrive_failed += 1
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -136,7 +194,7 @@ def setup_logging() -> None:
     handler = RotatingFileHandler(LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
     handler.setFormatter(_PrettyFormatter())
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    root.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
     root.addHandler(handler)
 
 
@@ -254,6 +312,19 @@ def _get_dcim_root(drive_letter: str) -> str:
     return os.path.join(drive_letter + "\\", "DCIM")
 
 
+def _find_dcim_drives() -> list[str]:
+    """Drive letters (e.g. 'D:') of currently attached volumes with a DCIM folder."""
+    return [f"{ch}:" for ch in "DEFGHIJKLMNOPQRSTUVWXYZ" if _has_dcim(f"{ch}:")]
+
+
+def _volume_serial(letter: str) -> str:
+    try:
+        disks = wmi.WMI().Win32_LogicalDisk(DeviceID=letter)
+        return disks[0].VolumeSerialNumber if disks else "UNKNOWN"
+    except Exception:
+        return "UNKNOWN"
+
+
 # ---------------------------------------------------------------------------
 # Pause state
 # ---------------------------------------------------------------------------
@@ -264,6 +335,52 @@ def is_sync_paused() -> bool:
             return bool(json.load(f).get("paused", False))
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Progress publishing (read by the tray icon)
+# ---------------------------------------------------------------------------
+def _write_progress(**fields) -> None:
+    """
+    Publish current sync progress to PROGRESS_PATH for the tray icon to
+    render (atomic write-and-replace, same pattern as notify.json).
+    Best-effort: progress display must never break the sync itself.
+
+    phase is one of: scanning | uploading | deleting | idle | error
+    """
+    fields["ts"] = datetime.now(timezone.utc).isoformat()
+    try:
+        os.makedirs(os.path.dirname(PROGRESS_PATH), exist_ok=True)
+        tmp = PROGRESS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(fields, f)
+        os.replace(tmp, PROGRESS_PATH)
+    except Exception:
+        pass
+
+
+def _upload_progress_fields(
+    stats: UploadStats, queue_bytes: int, queue_files: int,
+    photos_total: int, elapsed: float,
+) -> dict:
+    """Build the phase=uploading payload from live upload stats."""
+    speed = stats.bytes_uploaded / elapsed if elapsed > 0 else 0.0
+    remaining = max(queue_bytes - stats.bytes_uploaded, 0)
+    return {
+        "phase":          "uploading",
+        "files_done":     stats.uploaded,
+        "files_total":    queue_files,
+        "bytes_done":     stats.bytes_uploaded,
+        "bytes_total":    queue_bytes,
+        "photos_done":    stats.gphotos_count,
+        "photos_total":   photos_total,
+        "drive_done":     stats.gdrive_count,
+        "drive_total":    queue_files - photos_total,
+        "failed":         stats.failed,
+        "already_synced": stats.already_synced,
+        "speed_bps":      speed,
+        "eta_s":          int(remaining / speed) if speed > 0 else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +511,7 @@ def _upload_one(
     size_str = _fmt_size(cf.size_bytes)
     dest_dir = cf.drive_path.rsplit("/", 1)[0].split(":", 1)[-1]  # strip remote prefix
     for attempt in range(1, UPLOAD_MAX_RETRIES + 1):
-        log.info(
+        log.debug(
             "[%d/%d] Uploading %s (%s) -> %s",
             attempt, UPLOAD_MAX_RETRIES, cf.filename, size_str, dest_dir,
         )
@@ -403,7 +520,7 @@ def _upload_one(
             db_conn.execute(
                 "DELETE FROM failed_uploads WHERE drive_path = ?", (cf.drive_path,)
             )
-            log.info("[OK]      %s (%s) uploaded successfully", cf.filename, size_str)
+            log.debug("[OK]      %s (%s) uploaded successfully", cf.filename, size_str)
             return True
         if attempt < UPLOAD_MAX_RETRIES:
             log.warning(
@@ -424,13 +541,13 @@ def upload_new_files(
     camera_files: dict[str, CameraFile],
     db_conn: sqlite3.Connection,
     camera_serial: str,
-) -> tuple[bool, int]:
+) -> UploadStats:
     """
     Upload files not yet in the uploads index, then retry any in failed_uploads
-    that are still present on the camera. Returns (all_ok, n_uploaded).
+    that are still present on the camera. Returns per-destination UploadStats.
     Uses a thread pool (UPLOAD_WORKERS) for parallel uploads; each worker
     opens its own SQLite connection (WAL mode allows concurrent writers).
-    Deletions are skipped for this session if all_ok is False.
+    Deletions are skipped for this session if stats.all_ok is False.
     """
     existing     = {row[0] for row in db_conn.execute("SELECT drive_path FROM uploads")}
     failed_paths = {row[0] for row in db_conn.execute("SELECT drive_path FROM failed_uploads")}
@@ -441,16 +558,26 @@ def upload_new_files(
     ]
     to_retry = [cf for dp, cf in camera_files.items() if dp in failed_paths]
 
-    n_synced = len(camera_files) - len(new_files) - len(to_retry)
+    stats = UploadStats(
+        already_synced=len(camera_files) - len(new_files) - len(to_retry)
+    )
     log.info(
         "Upload plan: %d already synced | %d new | %d retry  [%d workers]",
-        n_synced, len(new_files), len(to_retry), UPLOAD_WORKERS,
+        stats.already_synced, len(new_files), len(to_retry), UPLOAD_WORKERS,
     )
 
-    queue    = new_files + to_retry
-    total    = len(queue)
-    uploaded = 0
-    all_ok   = True
+    queue = new_files + to_retry
+    # JPEGs bound for Google Photos upload first: they're small and shareable,
+    # so they land quickly while the bulky RAWs take their time.
+    queue.sort(key=lambda cf: 0 if _is_gphotos_path(cf.drive_path) else 1)
+    total        = len(queue)
+    queue_bytes  = sum(cf.size_bytes for cf in queue)
+    photos_total = sum(1 for cf in queue if _is_gphotos_path(cf.drive_path))
+    start_time   = time.time()
+    if total:
+        _write_progress(
+            **_upload_progress_fields(stats, queue_bytes, total, photos_total, 0.0)
+        )
 
     # Shared cancellation flag: set when pause is detected so queued workers
     # exit immediately without touching the network or the DB.
@@ -461,7 +588,7 @@ def upload_new_files(
         if pause_flag.is_set() or is_sync_paused():
             pause_flag.set()
             return 0
-        log.info("--- File %d/%d  [%s] ---", idx, total, cf.filename)
+        log.debug("--- File %d/%d  [%s] ---", idx, total, cf.filename)
         if not _is_size_stable(cf.full_path):
             log.warning("[SKIP]    %s is still being written -- skipping", cf.filename)
             return 0
@@ -476,26 +603,35 @@ def upload_new_files(
     with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS, thread_name_prefix="Upload") as pool:
         futures = {pool.submit(_worker, i, cf): cf for i, cf in enumerate(queue, 1)}
         for future in as_completed(futures):
+            cf = futures[future]
             try:
                 result = future.result()
             except Exception as exc:
                 log.error("Upload worker raised unexpectedly: %s", exc)
-                all_ok = False
+                stats.record_failure(cf)
                 continue
             if pause_flag.is_set():
                 # Drain remaining without acting on results
                 continue
             if result == 1:
-                uploaded += 1
+                stats.record_success(cf)
             elif result == -1:
-                all_ok = False
+                stats.record_failure(cf)
             # result == 0: skipped, no action
+            if result != 0:
+                _write_progress(**_upload_progress_fields(
+                    stats, queue_bytes, total, photos_total, time.time() - start_time
+                ))
 
     if pause_flag.is_set():
-        log.info("[PAUSED]  Upload stopped -- %d/%d file(s) uploaded before pause", uploaded, total)
-        return False, uploaded
+        log.info(
+            "[PAUSED]  Upload stopped -- %d/%d file(s) uploaded before pause",
+            stats.uploaded, total,
+        )
+        stats.all_ok = False
+        stats.paused = True
 
-    return all_ok, uploaded
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -586,12 +722,12 @@ def upload_new_files_batch(
     camera_files: dict[str, CameraFile],
     db_conn: sqlite3.Connection,
     camera_serial: str,
-) -> tuple[bool, int]:
+) -> UploadStats:
     """
     Batch upload variant of upload_new_files(). Groups files by
     (local source directory, Drive destination directory) and uploads each
     group in chunks of BATCH_SIZE with a single rclone call per chunk.
-    Returns (all_ok, n_uploaded).
+    Returns per-destination UploadStats.
 
     Controlled by env vars:
         UPLOAD_MODE=batch   -- selects this path in run_sync_pipeline()
@@ -608,16 +744,18 @@ def upload_new_files_batch(
     ]
     to_retry = [cf for dp, cf in camera_files.items() if dp in failed_paths]
 
-    n_synced = len(camera_files) - len(new_files) - len(to_retry)
+    stats = UploadStats(
+        already_synced=len(camera_files) - len(new_files) - len(to_retry)
+    )
     log.info(
         "Upload plan (batch): %d already synced | %d new | %d retry  [batch_size=%d]",
-        n_synced, len(new_files), len(to_retry), BATCH_SIZE,
+        stats.already_synced, len(new_files), len(to_retry), BATCH_SIZE,
     )
 
     queue = new_files + to_retry
     total = len(queue)
     if not total:
-        return True, 0
+        return stats
 
     # Group by (local source dir, Drive dest dir) so each rclone call copies
     # from exactly one folder to exactly one folder via --files-from.
@@ -631,6 +769,10 @@ def upload_new_files_batch(
     for (source_dir, dest_dir), files in groups.items():
         for i in range(0, len(files), BATCH_SIZE):
             batches.append((source_dir, dest_dir, files[i : i + BATCH_SIZE]))
+    # Google Photos batches first: JPEGs are small and shareable, so they
+    # land quickly while the bulky RAWs take their time (stable sort keeps
+    # the original order within each destination).
+    batches.sort(key=lambda b: 0 if _is_gphotos_path(b[1]) else 1)
 
     n_batches = len(batches)
     log.info(
@@ -639,11 +781,14 @@ def upload_new_files_batch(
     )
     log.info("  %s", _progress_bar(0, n_batches))
 
-    uploaded       = 0
-    bytes_uploaded = 0
-    all_ok         = True
-    pause_flag     = threading.Event()
-    start_time     = time.time()
+    pause_flag   = threading.Event()
+    start_time   = time.time()
+    queue_bytes  = sum(cf.size_bytes for cf in queue)
+    photos_total = sum(1 for cf in queue if _is_gphotos_path(cf.drive_path))
+    _write_progress(
+        **_upload_progress_fields(stats, queue_bytes, total, photos_total, 0.0),
+        batch=0, batches=n_batches,
+    )
 
     for batch_idx, (source_dir, dest_dir, batch_files) in enumerate(batches, 1):
         if pause_flag.is_set() or is_sync_paused():
@@ -664,65 +809,62 @@ def upload_new_files_batch(
         conn.execute("PRAGMA journal_mode=WAL")
         conn.isolation_level = None
         try:
-            # Google Photos backend hangs on rclone copy <dir> --files-from;
-            # upload each file individually instead.
-            if _is_gphotos_path(dest_dir):
+            batch_ok = False
+            for attempt in range(1, UPLOAD_MAX_RETRIES + 1):
+                if _rclone_copy_batch(stable, dest_dir):
+                    for cf in stable:
+                        _insert_upload(conn, cf, camera_serial)
+                        conn.execute(
+                            "DELETE FROM failed_uploads WHERE drive_path = ?",
+                            (cf.drive_path,),
+                        )
+                        log.debug(
+                            "[OK]      %s (%s) uploaded", cf.filename, _fmt_size(cf.size_bytes)
+                        )
+                        stats.record_success(cf)
+                    batch_ok = True
+                    break
+                if attempt < UPLOAD_MAX_RETRIES:
+                    log.warning(
+                        "[RETRY]   Batch attempt %d/%d failed for %d file(s) -> %s -- waiting %ds",
+                        attempt, UPLOAD_MAX_RETRIES, len(stable), dest_dir, UPLOAD_RETRY_DELAY,
+                    )
+                    time.sleep(UPLOAD_RETRY_DELAY)
+
+            if not batch_ok:
+                log.warning(
+                    "[FALLBACK] Batch failed after %d attempts -> retrying %d file(s) individually",
+                    UPLOAD_MAX_RETRIES, len(stable),
+                )
                 for cf in stable:
                     if _upload_one(cf, conn, camera_serial):
-                        uploaded       += 1
-                        bytes_uploaded += cf.size_bytes
+                        stats.record_success(cf)
                     else:
-                        all_ok = False
-            else:
-                batch_ok = False
-                for attempt in range(1, UPLOAD_MAX_RETRIES + 1):
-                    if _rclone_copy_batch(stable, dest_dir):
-                        for cf in stable:
-                            _insert_upload(conn, cf, camera_serial)
-                            conn.execute(
-                                "DELETE FROM failed_uploads WHERE drive_path = ?",
-                                (cf.drive_path,),
-                            )
-                            log.info(
-                                "[OK]      %s (%s) uploaded", cf.filename, _fmt_size(cf.size_bytes)
-                            )
-                            uploaded       += 1
-                            bytes_uploaded += cf.size_bytes
-                        batch_ok = True
-                        break
-                    if attempt < UPLOAD_MAX_RETRIES:
-                        log.warning(
-                            "[RETRY]   Batch attempt %d/%d failed for %d file(s) -> %s -- waiting %ds",
-                            attempt, UPLOAD_MAX_RETRIES, len(stable), dest_dir, UPLOAD_RETRY_DELAY,
-                        )
-                        time.sleep(UPLOAD_RETRY_DELAY)
-
-                if not batch_ok:
-                    log.warning(
-                        "[FALLBACK] Batch failed after %d attempts -> retrying %d file(s) individually",
-                        UPLOAD_MAX_RETRIES, len(stable),
-                    )
-                    for cf in stable:
-                        if not _upload_one(cf, conn, camera_serial):
-                            all_ok = False
+                        stats.record_failure(cf)
         finally:
             conn.close()
 
         elapsed = time.time() - start_time
-        speed   = bytes_uploaded / elapsed if elapsed > 0 else 0
+        speed   = stats.bytes_uploaded / elapsed if elapsed > 0 else 0
         log.info(
             "  %s | %d file(s) | %s | avg %s",
-            _progress_bar(batch_idx, n_batches), uploaded, _fmt_size(bytes_uploaded), _fmt_speed(speed),
+            _progress_bar(batch_idx, n_batches), stats.uploaded,
+            _fmt_size(stats.bytes_uploaded), _fmt_speed(speed),
+        )
+        _write_progress(
+            **_upload_progress_fields(stats, queue_bytes, total, photos_total, elapsed),
+            batch=batch_idx, batches=n_batches,
         )
 
     if pause_flag.is_set():
         log.info(
             "[PAUSED]  Upload stopped -- %d/%d file(s) uploaded before pause",
-            uploaded, total,
+            stats.uploaded, total,
         )
-        return False, uploaded
+        stats.all_ok = False
+        stats.paused = True
 
-    return all_ok, uploaded
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -898,6 +1040,52 @@ def send_notification(upload_ok: bool, uploaded: int, deleted: int) -> None:
 # ---------------------------------------------------------------------------
 # Top-level pipeline orchestrator
 # ---------------------------------------------------------------------------
+def _log_sync_summary(stats: UploadStats, deleted: int, elapsed: float) -> None:
+    """
+    Print the end-of-sync summary block: per-destination upload counts,
+    skipped/deleted/failed totals, elapsed time, and average speed.
+    """
+    if stats.paused:
+        headline = "Sync PAUSED -- remaining files sync next session"
+    elif stats.all_ok:
+        headline = "Sync complete"
+    else:
+        headline = "Sync finished with ERRORS"
+
+    # ASCII only: the log is read with tools that guess the encoding
+    # (PowerShell 5.1 Get-Content, notepad), which mangle UTF-8 glyphs.
+    def _mark(failed: int) -> str:
+        return "OK" if failed == 0 else f"{failed} FAILED"
+
+    log.info("=" * 60)
+    log.info("%s  [%s]", headline, _fmt_duration(elapsed))
+    if GPHOTOS_REMOTE:
+        log.info(
+            "  %-15s ->  %4d JPEGs  %10s   %s",
+            "Google Photos", stats.gphotos_count,
+            _fmt_size(stats.gphotos_bytes), _mark(stats.gphotos_failed),
+        )
+        log.info(
+            "  %-15s ->  %4d RAW    %10s   %s",
+            "Google Drive", stats.gdrive_count,
+            _fmt_size(stats.gdrive_bytes), _mark(stats.gdrive_failed),
+        )
+    else:
+        log.info(
+            "  %-15s ->  %4d files  %10s   %s",
+            "Google Drive", stats.gdrive_count,
+            _fmt_size(stats.gdrive_bytes), _mark(stats.gdrive_failed),
+        )
+    log.info("  %-15s ->  %4d files", "Already synced", stats.already_synced)
+    log.info("  %-15s ->  %4d", "Deleted", deleted)
+    log.info("  %-15s ->  %4d", "Failed", stats.failed)
+    if stats.bytes_uploaded:
+        speed = stats.bytes_uploaded / elapsed if elapsed > 0 else 0.0
+        log.info("  %-15s ->  %s (avg %s)",
+                 "Uploaded", _fmt_size(stats.bytes_uploaded), _fmt_speed(speed))
+    log.info("=" * 60)
+
+
 def run_sync_pipeline(
     drive_letter: str,
     camera_serial: str,
@@ -908,35 +1096,47 @@ def run_sync_pipeline(
     Raises on systemic errors (rclone missing, scan I/O failure) so the
     WMI listener's backoff loop can retry the whole pipeline.
     """
+    start_time = time.time()
     log.info("=" * 60)
     log.info("Sync started -- drive %s  serial %s", drive_letter, camera_serial)
     dcim_root = _get_dcim_root(drive_letter)
     log.info("DCIM root: %s", dcim_root)
 
+    _write_progress(phase="scanning", drive_letter=drive_letter)
     camera_files = scan_camera_files(dcim_root)  # OSError propagates -> backoff
 
     log.info("-" * 40)
     log.info("Phase: Upload  [mode=%s]", UPLOAD_MODE)
     if UPLOAD_MODE == "batch":
-        upload_ok, uploaded_count = upload_new_files_batch(camera_files, db_conn, camera_serial)
+        stats = upload_new_files_batch(camera_files, db_conn, camera_serial)
     else:
-        upload_ok, uploaded_count = upload_new_files(camera_files, db_conn, camera_serial)
+        stats = upload_new_files(camera_files, db_conn, camera_serial)
 
     deleted_count = 0
     log.info("-" * 40)
     log.info("Phase: Delete")
-    if upload_ok:
+    if stats.all_ok:
+        _write_progress(phase="deleting")
         deleted_count = delete_removed_files(camera_files, db_conn)
     else:
         log.warning("Some uploads failed -- deletions skipped this session")
 
-    send_notification(upload_ok, uploaded_count, deleted_count)
-    log.info("-" * 40)
-    log.info(
-        "Sync finished -- uploaded=%d  deleted=%d  success=%s",
-        uploaded_count, deleted_count, upload_ok,
+    send_notification(stats.all_ok, stats.uploaded, deleted_count)
+    elapsed = time.time() - start_time
+    _log_sync_summary(stats, deleted_count, elapsed)
+    _write_progress(
+        phase="idle",
+        ok=stats.all_ok,
+        paused=stats.paused,
+        photos_uploaded=stats.gphotos_count,
+        drive_uploaded=stats.gdrive_count,
+        uploaded=stats.uploaded,
+        bytes_uploaded=stats.bytes_uploaded,
+        failed=stats.failed,
+        deleted=deleted_count,
+        already_synced=stats.already_synced,
+        elapsed_s=int(elapsed),
     )
-    log.info("=" * 60)
 
 
 # ---------------------------------------------------------------------------
@@ -976,6 +1176,7 @@ class WMIListenerThread(threading.Thread):
         self._stop_event = stop_event
         self._sync_lock  = sync_lock
         self._db_conn    = db_conn
+        self._was_paused = is_sync_paused()
 
     def run(self) -> None:
         pythoncom.CoInitialize()
@@ -991,6 +1192,10 @@ class WMIListenerThread(threading.Thread):
                 c = wmi.WMI()
                 watcher = c.Win32_VolumeChangeEvent.watch_for(EventType=2)
                 log.info("WMI listener ready -- watching for USB camera events")
+                # A camera plugged in before the service (re)started never
+                # fires an arrival event -- sync it now instead of waiting
+                # for a replug.
+                self._sync_attached_cameras("service start")
                 self._event_loop(watcher)
             except Exception as exc:
                 log.error("WMI setup error: %s -- retrying in 30 s", exc)
@@ -1002,6 +1207,7 @@ class WMIListenerThread(threading.Thread):
             try:
                 event = watcher(timeout_ms=5000)
             except wmi.x_wmi_timed_out:
+                self._check_unpause_resume()
                 continue
             except Exception as exc:
                 log.error("WMI watcher error: %s -- rebuilding watcher", exc)
@@ -1040,6 +1246,38 @@ class WMIListenerThread(threading.Thread):
             finally:
                 self._sync_lock.release()
 
+    def _check_unpause_resume(self) -> None:
+        """
+        Detect the paused -> unpaused edge (tray toggle) and immediately sync
+        any camera that is already attached, instead of waiting for the next
+        USB arrival event.
+        """
+        paused = is_sync_paused()
+        if self._was_paused and not paused:
+            log.info("Sync resumed via tray -- checking for attached cameras")
+            self._sync_attached_cameras("resume")
+        self._was_paused = paused
+
+    def _sync_attached_cameras(self, reason: str) -> None:
+        """Run the pipeline for every already-attached DCIM volume."""
+        if is_sync_paused():
+            return
+        for letter in _find_dcim_drives():
+            serial = _volume_serial(letter)
+            log.info(
+                "Camera already attached on %s  serial %s -- syncing (%s)",
+                letter, serial, reason,
+            )
+            if not self._sync_lock.acquire(blocking=False):
+                log.warning(
+                    "Sync already in progress -- skipping attached drive %s", letter
+                )
+                continue
+            try:
+                self._run_with_backoff(letter, serial)
+            finally:
+                self._sync_lock.release()
+
     def _run_with_backoff(self, drive_letter: str, camera_serial: str) -> None:
         """
         Run the sync pipeline for one camera event, retrying with exponential
@@ -1065,6 +1303,9 @@ class WMIListenerThread(threading.Thread):
                 log.error(
                     "[BACKOFF] Pipeline attempt %d failed: %s",
                     attempt, exc,
+                )
+                _write_progress(
+                    phase="error", error=str(exc)[:200], retry_in_s=backoff
                 )
                 log.error(
                     "[BACKOFF] Retrying in %ds (next cap %ds, max %ds)",

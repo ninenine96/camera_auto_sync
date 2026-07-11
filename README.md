@@ -123,9 +123,11 @@ copy .env.example .env
 | `LOG_PATH` | ➖ | `C:\ProgramData\CameraSync\sync.log` | Rotating log file path |
 | `STATE_PATH` | ➖ | `C:\ProgramData\CameraSync\state.json` | Tray pause-state file |
 | `NOTIFY_PATH` | ➖ | `C:\ProgramData\CameraSync\notify.json` | Notification queue file |
+| `PROGRESS_PATH` | ➖ | `C:\ProgramData\CameraSync\progress.json` | Live sync progress published for the tray icon |
 | `UPLOAD_MODE` | ➖ | `individual` | Upload strategy: `individual` or `batch` — see [Upload modes](#-upload-modes) |
 | `BATCH_SIZE` | ➖ | `10` | Files per rclone call in `batch` mode |
 | `UPLOAD_WORKERS` | ➖ | `4` | Parallel upload threads in `individual` mode |
+| `LOG_LEVEL` | ➖ | `INFO` | Set `DEBUG` to log every uploaded file individually (`[OK]` lines) |
 
 `C:\ProgramData\CameraSync\` is created automatically on first run.
 
@@ -172,7 +174,26 @@ The tray icon runs in your user session, not as part of the service. Start it ma
    ```
 4. Name it **Camera Sync Tray** and click Finish.
 
-Right-click the tray icon to pause/resume sync or quit.
+The icon shows sync state at a glance:
+
+| Icon | Meaning |
+|---|---|
+| Teal camera | Idle — waiting for a camera |
+| Grey camera filling up with blue | Sync in progress — fill level = % uploaded, like a battery indicator |
+| Grey camera, yellow pause bars | Paused |
+| Red camera, white `!` | Sync failing — service is retrying with backoff |
+
+Hover the icon (or open the menu — the first line is a live status) for details while syncing, e.g.:
+
+```
+Syncing 100/261 RAW, 90/243 JPG — 46%, 42.3 MB/s, ETA 4m 20s
+```
+
+When idle, the tooltip shows the last sync result. The service publishes progress to `progress.json` after every batch (`batch` mode) or file (`individual` mode); the tray polls it once a second. Right-click the icon to pause/resume sync, open the log, or quit.
+
+When Google Photos routing is enabled, JPEG batches upload **before** RAW batches so shareable photos land in Photos first.
+
+Resuming from pause (and service startup) checks for an already-attached camera and syncs it immediately — no need to replug.
 
 ---
 
@@ -243,14 +264,23 @@ Example output (batch mode):
 2026-05-10 14:07:32  INFO  Batch upload starting -- 30 batch(es) | 675 file(s) | 5 destination folder(s)
 2026-05-10 14:07:32  INFO    [------------------------------] 0/30 (0%)
 2026-05-10 14:07:32  INFO  --- Batch 1/30  [25 file(s)  D:\DCIM\100MSDCF -> gdrive:Photography/Prime/2026/05/RAW] ---
-2026-05-10 14:07:45  INFO  [OK]      DSC00001.ARW (24.0 MB) uploaded
 2026-05-10 14:07:46  INFO    [#-----------------------------] 1/30 (3%) | 25 file(s) | 600.0 MB | avg 46.1 MB/s
 ...
 2026-05-10 14:12:10  INFO    [##############################] 30/30 (100%) | 675 file(s) | 15.8 GB | avg 52.3 MB/s
 2026-05-10 14:12:10  INFO  Phase: Delete
 2026-05-10 14:12:10  INFO  0 file(s) to delete from Drive
-2026-05-10 14:12:10  INFO  Sync finished -- uploaded=675  deleted=0  success=True
+2026-05-10 14:12:10  INFO  ============================================================
+2026-05-10 14:12:10  INFO  Sync complete  [4m 39s]
+2026-05-10 14:12:10  INFO    Google Photos   ->   337 JPEGs      4.1 GB   OK
+2026-05-10 14:12:10  INFO    Google Drive    ->   338 RAW       11.7 GB   OK
+2026-05-10 14:12:10  INFO    Already synced  ->     0 files
+2026-05-10 14:12:10  INFO    Deleted         ->     0
+2026-05-10 14:12:10  INFO    Failed          ->     0
+2026-05-10 14:12:10  INFO    Uploaded        ->  15.8 GB (avg 52.3 MB/s)
+2026-05-10 14:12:10  INFO  ============================================================
 ```
+
+Per-file `[OK]` lines are logged at `DEBUG` — the summary block replaces them. Set `LOG_LEVEL=DEBUG` in `.env` to get them back.
 
 ---
 

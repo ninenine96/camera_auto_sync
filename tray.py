@@ -3,13 +3,22 @@ Camera Auto Sync — System Tray Icon
 Runs in the user's desktop session (not as part of the service).
 
 Menu:
+  <status line>             — live sync status (same text as the tooltip)
   Pause sync / Resume sync  — toggles state.json; service reads it before each run
+  Open sync log             — opens sync.log in the default editor
   Quit                      — exits this process only, not the service
 
-Also polls notify.json written by the service and surfaces toasts via win10toast.
+The icon shows sync state at a glance:
+  teal — idle
+  grey filling up with blue (battery-style) — sync in progress; fill = % uploaded
+  red with !            — sync failing, service is retrying
+  grey with pause bars  — paused
+
+Reads progress.json (published by the service during each sync) and
+notify.json (toast queue) from C:\\ProgramData\\CameraSync.
 
 Autostart: place a shortcut to this script (or a .bat that runs it) in
-    %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
+    %APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup
 """
 
 import json
@@ -19,6 +28,7 @@ import sys
 import threading
 import time
 import winreg
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Add venv site-packages so this script runs without activating the venv
@@ -62,9 +72,11 @@ def _register_app_id() -> None:
 # ---------------------------------------------------------------------------
 # Paths — must match service.py / .env defaults
 # ---------------------------------------------------------------------------
-_DATA_DIR   = r"C:\ProgramData\CameraSync"
-STATE_PATH  = os.path.join(_DATA_DIR, "state.json")
-NOTIFY_PATH = os.path.join(_DATA_DIR, "notify.json")
+_DATA_DIR     = r"C:\ProgramData\CameraSync"
+STATE_PATH    = os.path.join(_DATA_DIR, "state.json")
+NOTIFY_PATH   = os.path.join(_DATA_DIR, "notify.json")
+PROGRESS_PATH = os.path.join(_DATA_DIR, "progress.json")
+LOG_PATH      = os.path.join(_DATA_DIR, "sync.log")
 
 
 # ---------------------------------------------------------------------------
@@ -91,32 +103,158 @@ def _is_paused() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Progress (published by service.py during each sync)
+# ---------------------------------------------------------------------------
+_ACTIVE_PHASES = ("scanning", "uploading", "deleting")
+_STALE_AFTER_S = 900  # active progress older than this = service died mid-sync
+
+
+def _read_progress() -> dict | None:
+    try:
+        with open(PROGRESS_PATH, encoding="utf-8") as f:
+            p = json.load(f)
+        ts  = datetime.fromisoformat(p["ts"])
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception:
+        return None
+    if p.get("phase") in _ACTIVE_PHASES and age > _STALE_AFTER_S:
+        return None  # don't show a stuck "syncing" state forever
+    return p
+
+
+def _fmt_speed(bps: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if bps < 1024:
+            return f"{bps:.1f} {unit}/s"
+        bps /= 1024
+    return f"{bps:.1f} TB/s"
+
+
+def _fmt_eta(seconds) -> str:
+    s = int(seconds or 0)
+    if s >= 3600:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    if s >= 60:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s}s"
+
+
+def _icon_state(progress: dict | None, paused: bool) -> str:
+    if paused:
+        return "paused"
+    if progress is None:
+        return "idle"
+    phase = progress.get("phase")
+    if phase in _ACTIVE_PHASES:
+        return "syncing"
+    if phase == "error":
+        return "error"
+    return "idle"
+
+
+def _status_text(p: dict | None, paused: bool) -> str:
+    """One-line status for the tooltip and the menu header (max ~127 chars)."""
+    if paused:
+        return "Camera Sync — paused"
+    if p is None:
+        return "Camera Sync — idle"
+    phase = p.get("phase")
+    if phase == "scanning":
+        return f"Camera Sync — scanning {p.get('drive_letter', 'card')}\\DCIM…"
+    if phase == "uploading":
+        bytes_total = p.get("bytes_total") or 0
+        pct = round(100 * p.get("bytes_done", 0) / bytes_total) if bytes_total else 0
+        if p.get("photos_total"):
+            core = (
+                f"{p.get('drive_done', 0)}/{p.get('drive_total', 0)} RAW, "
+                f"{p.get('photos_done', 0)}/{p.get('photos_total', 0)} JPG"
+            )
+        else:
+            core = f"{p.get('files_done', 0)}/{p.get('files_total', 0)} files"
+        text = f"Syncing {core} — {pct}%"
+        if p.get("speed_bps"):
+            text += f", {_fmt_speed(p['speed_bps'])}"
+        if p.get("eta_s") is not None:
+            text += f", ETA {_fmt_eta(p['eta_s'])}"
+        if p.get("failed"):
+            text += f" ({p['failed']} failed)"
+        return text
+    if phase == "deleting":
+        return "Camera Sync — removing deleted files from Drive…"
+    if phase == "error":
+        if p.get("retry_in_s"):
+            return f"Camera Sync — sync error, retrying in {_fmt_eta(p['retry_in_s'])}"
+        return "Camera Sync — sync error (see log)"
+    # idle: show what the last sync did
+    if p.get("uploaded") or p.get("failed"):
+        parts = []
+        if p.get("drive_uploaded"):
+            parts.append(f"{p['drive_uploaded']} RAW")
+        if p.get("photos_uploaded"):
+            parts.append(f"{p['photos_uploaded']} JPG")
+        what = " + ".join(parts) or f"{p.get('uploaded', 0)} files"
+        tail = "" if p.get("ok") else f", {p.get('failed', 0)} failed!"
+        return f"Camera Sync — last sync: {what} in {_fmt_eta(p.get('elapsed_s', 0))}{tail}"
+    return "Camera Sync — idle (all synced)"
+
+
+# ---------------------------------------------------------------------------
 # Icon drawing
 # ---------------------------------------------------------------------------
-def _make_icon(paused: bool = False) -> Image.Image:
-    """
-    Draw a 64×64 camera icon.
-    Teal (#009688) when active, grey (#646464) when paused.
-    Two yellow pause bars are overlaid on the lens when paused.
-    """
-    size   = 64
-    img    = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw   = ImageDraw.Draw(img)
-    colour = (100, 100, 100, 255) if paused else (0, 150, 136, 255)
+_COLOURS = {
+    "idle":    (0, 150, 136, 255),    # teal
+    "paused":  (100, 100, 100, 255),  # grey
+    "syncing": (2, 136, 209, 255),    # blue
+    "error":   (211, 47, 47, 255),    # red
+}
 
+
+_BODY_TOP, _BODY_BOTTOM = 11, 54  # y extent of the camera silhouette
+
+
+def _draw_camera_body(draw: ImageDraw.ImageDraw, colour: tuple) -> None:
     # Camera body
     draw.rounded_rectangle([6, 18, 58, 54], radius=7, fill=colour)
     # Viewfinder bump
-    draw.rectangle([22, 11, 38, 20], fill=colour)
+    draw.rectangle([22, _BODY_TOP, 38, 20], fill=colour)
+
+
+def _make_icon(state: str = "idle", fill: float | None = None) -> Image.Image:
+    """
+    Draw the 64×64 camera icon.
+    state: idle | paused | syncing | error (see _COLOURS).
+    While syncing the body fills bottom-up with blue like a battery
+    indicator: fill 0.0 = all grey, 1.0 = fully blue.
+    """
+    size = 64
+    img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    if state == "syncing":
+        frac = min(max(fill or 0.0, 0.0), 1.0)
+        _draw_camera_body(draw, (110, 110, 110, 255))  # grey base
+        if frac > 0:
+            overlay = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            _draw_camera_body(ImageDraw.Draw(overlay), _COLOURS["syncing"])
+            y_cut = round(_BODY_BOTTOM - (_BODY_BOTTOM - _BODY_TOP) * frac)
+            band  = overlay.crop((0, y_cut, size, size))
+            img.paste(band, (0, y_cut), band)
+    else:
+        _draw_camera_body(draw, _COLOURS.get(state, _COLOURS["idle"]))
+
     # Lens outer ring
     draw.ellipse([17, 24, 47, 48], fill=(220, 220, 220, 255))
     # Lens inner (dark)
     draw.ellipse([23, 30, 41, 42], fill=(40, 40, 40, 255))
 
-    if paused:
+    if state == "paused":
         # Yellow pause bars over the lens
         draw.rectangle([25, 30, 30, 42], fill=(255, 200, 0, 255))
         draw.rectangle([34, 30, 39, 42], fill=(255, 200, 0, 255))
+    elif state == "error":
+        # White exclamation mark over the lens
+        draw.rectangle([30, 27, 34, 38], fill=(255, 255, 255, 255))
+        draw.rectangle([30, 41, 34, 45], fill=(255, 255, 255, 255))
 
     return img
 
@@ -143,7 +281,7 @@ $toast=[Windows.UI.Notifications.ToastNotification]::new($xml)
 def _log_tray(msg: str) -> None:
     try:
         with open(_TRAY_LOG, "a", encoding="utf-8") as f:
-            f.write(f"{__import__('datetime').datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
     except Exception:
         pass
 
@@ -175,7 +313,7 @@ def _notify(title: str, msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Notification poller
+# Pollers
 # ---------------------------------------------------------------------------
 def _notification_poller(stop_event: threading.Event) -> None:
     """Poll NOTIFY_PATH every 5 s and surface any pending toast."""
@@ -194,21 +332,66 @@ def _notification_poller(stop_event: threading.Event) -> None:
         stop_event.wait(timeout=5)
 
 
+def _sync_fill(progress: dict) -> float:
+    """Battery fill level for the syncing icon, from bytes uploaded."""
+    phase = progress.get("phase")
+    if phase == "deleting":
+        return 1.0
+    if phase != "uploading":
+        return 0.0  # scanning
+    bytes_total = progress.get("bytes_total") or 0
+    return progress.get("bytes_done", 0) / bytes_total if bytes_total else 0.0
+
+
+def _progress_poller(icon: pystray.Icon, stop_event: threading.Event) -> None:
+    """
+    Redraw the icon and tooltip from progress.json every second, but only
+    when the state, fill level, or text actually changed.
+    """
+    last = None
+    while not stop_event.is_set():
+        try:
+            paused   = _is_paused()
+            progress = _read_progress()
+            state    = _icon_state(progress, paused)
+            title    = _status_text(progress, paused)[:127]
+            fill     = _sync_fill(progress) if state == "syncing" else None
+            # Quantise fill to icon pixels so we don't redraw for sub-pixel change
+            key = (state, title, None if fill is None else round(fill * 43))
+            if key != last:
+                icon.icon  = _make_icon(state, fill)
+                icon.title = title
+                last = key
+        except Exception as exc:
+            _log_tray(f"progress poller error: {exc}")
+        stop_event.wait(timeout=1)
+
+
+# ---------------------------------------------------------------------------
+# Menu actions
+# ---------------------------------------------------------------------------
 def _toggle_pause(icon: pystray.Icon, _item) -> None:
     try:
         state = _read_state()
         state["paused"] = not state.get("paused", False)
         _write_state(state)
         paused = state["paused"]
-        icon.icon  = _make_icon(paused)
-        icon.title = "Camera Sync (paused)" if paused else "Camera Sync"
+        icon.icon  = _make_icon("paused" if paused else "idle")
+        icon.title = _status_text(_read_progress(), paused)[:127]
         icon.update_menu()
         if paused:
             _notify("Camera Sync — Paused", "Plug-in events will be ignored until you resume.")
         else:
-            _notify("Camera Sync — Resumed", "Sync will run on the next camera connection.")
+            _notify("Camera Sync — Resumed", "Syncing now if a camera is attached.")
     except Exception as exc:
         _log_tray(f"_toggle_pause error: {exc}")
+
+
+def _open_log(_icon, _item) -> None:
+    try:
+        os.startfile(LOG_PATH)
+    except Exception as exc:
+        _log_tray(f"_open_log error: {exc}")
 
 
 def _quit(icon: pystray.Icon, _item) -> None:
@@ -219,34 +402,44 @@ def _pause_label(_item) -> str:
     return "Resume sync" if _is_paused() else "Pause sync"
 
 
+def _status_label(_item) -> str:
+    return _status_text(_read_progress(), _is_paused())
+
+
 def main() -> None:
     _register_app_id()
     stop_event = threading.Event()
-    poller = threading.Thread(
-        target=_notification_poller,
-        args=(stop_event,),
-        daemon=True,
-        name="NotifyPoller",
-    )
-    poller.start()
 
     paused = _is_paused()
     icon = pystray.Icon(
         name="CameraSync",
-        icon=_make_icon(paused),
-        title="Camera Sync (paused)" if paused else "Camera Sync",
+        icon=_make_icon("paused" if paused else "idle"),
+        title=_status_text(_read_progress(), paused)[:127],
         menu=pystray.Menu(
+            pystray.MenuItem(_status_label, None, enabled=False),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem(_pause_label, _toggle_pause, default=False),
+            pystray.MenuItem("Open sync log", _open_log),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit tray", _quit),
         ),
     )
 
+    pollers = [
+        threading.Thread(target=_notification_poller, args=(stop_event,),
+                         daemon=True, name="NotifyPoller"),
+        threading.Thread(target=_progress_poller, args=(icon, stop_event),
+                         daemon=True, name="ProgressPoller"),
+    ]
+    for t in pollers:
+        t.start()
+
     try:
         icon.run()
     finally:
         stop_event.set()
-        poller.join(timeout=10)
+        for t in pollers:
+            t.join(timeout=10)
 
 
 if __name__ == "__main__":
